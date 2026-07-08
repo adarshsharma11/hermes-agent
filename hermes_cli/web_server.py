@@ -38,7 +38,10 @@ import zipfile
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import uvicorn
 
 import yaml
 
@@ -13693,6 +13696,426 @@ async def post_plugin_visibility(request: Request, name: str, body: _PluginVisib
     config["dashboard"]["hidden_plugins"] = hidden_list
     save_config(config)
     return {"ok": True, "name": name, "hidden": body.hidden}
+
+
+class BlogSearchRequest(BaseModel):
+    project_id: str
+    topic: str
+    threshold: Optional[float] = 0.85
+
+
+class BlogPublishRequest(BaseModel):
+    project_id: str
+    platform: str
+    title: str
+    content: str
+    topic: Optional[str] = ""
+    slug: Optional[str] = ""
+    keywords: Optional[str] = ""
+    categories: Optional[str] = ""
+    author: Optional[str] = ""
+    wordpress_url: Optional[str] = ""
+    status: Optional[str] = "publish"
+
+
+def _is_local_request(request: Request) -> bool:
+    import socket
+    client_host = request.client.host if request.client else ""
+    if client_host in ("127.0.0.1", "localhost", "::1", "31.97.129.250"):
+        return True
+    try:
+        local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+        if client_host in local_ips:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _init_blog_db():
+    import psycopg2
+    
+    host = os.environ.get("POSTGRES_HOST") or os.environ.get("PG_HOST") or "localhost"
+    port = int(os.environ.get("POSTGRES_PORT") or os.environ.get("PG_PORT") or "5432")
+    user = os.environ.get("POSTGRES_USER") or os.environ.get("PG_USER") or "postgres"
+    password = os.environ.get("POSTGRES_PASSWORD") or os.environ.get("PG_PASSWORD") or "postgres"
+    dbname = os.environ.get("POSTGRES_DB") or os.environ.get("PG_DB") or "postgres"
+    
+    conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        
+        has_pgvector = False
+        try:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            has_pgvector = True
+        except Exception:
+            pass
+            
+        if has_pgvector:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS blog_metadata (
+                    id SERIAL PRIMARY KEY,
+                    project_id VARCHAR(100) NOT NULL,
+                    platform VARCHAR(50) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    topic TEXT,
+                    slug VARCHAR(255),
+                    keywords TEXT,
+                    categories TEXT,
+                    author VARCHAR(100),
+                    wordpress_url TEXT,
+                    published_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    embedding vector(1536)
+                )
+            """)
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS blog_metadata (
+                    id SERIAL PRIMARY KEY,
+                    project_id VARCHAR(100) NOT NULL,
+                    platform VARCHAR(50) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    topic TEXT,
+                    slug VARCHAR(255),
+                    keywords TEXT,
+                    categories TEXT,
+                    author VARCHAR(100),
+                    wordpress_url TEXT,
+                    published_date TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    embedding double precision[]
+                )
+            """)
+            cur.execute("""
+                CREATE OR REPLACE FUNCTION cosine_similarity(a double precision[], b double precision[])
+                RETURNS double precision AS $$
+                DECLARE
+                    dot_product double precision := 0;
+                    norm_a double precision := 0;
+                    norm_b double precision := 0;
+                    i integer;
+                BEGIN
+                    IF array_length(a, 1) IS NULL OR array_length(b, 1) IS NULL OR array_length(a, 1) != array_length(b, 1) THEN
+                        RETURN 0;
+                    END IF;
+                    FOR i IN 1..array_length(a, 1) LOOP
+                        dot_product := dot_product + (a[i] * b[i]);
+                        norm_a := norm_a + (a[i] * a[i]);
+                        norm_b := norm_b + (b[i] * b[i]);
+                    END LOOP;
+                    IF norm_a = 0 OR norm_b = 0 THEN
+                        RETURN 0;
+                    END IF;
+                    RETURN dot_product / (sqrt(norm_a) * sqrt(norm_b));
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
+        cur.close()
+    finally:
+        conn.close()
+
+
+def _generate_embedding(text: str) -> list[float]:
+    import urllib.request
+    import json
+    import hashlib
+    import math
+    
+    text = text.strip()
+    
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/embeddings",
+                data=json.dumps({"input": text, "model": "text-embedding-3-small"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {openai_key}"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as res:
+                body = json.loads(res.read().decode("utf-8"))
+                return body["data"][0]["embedding"]
+        except Exception:
+            pass
+            
+    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if gemini_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={gemini_key}"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({
+                    "model": "models/text-embedding-004",
+                    "content": {"parts": [{"text": text}]}
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as res:
+                body = json.loads(res.read().decode("utf-8"))
+                emb = body["embedding"]["values"]
+                if len(emb) < 1536:
+                    emb = emb + [0.0] * (1536 - len(emb))
+                return emb
+        except Exception:
+            pass
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if openrouter_key:
+        try:
+            req = urllib.request.Request(
+                "https://openrouter.ai/api/v1/embeddings",
+                data=json.dumps({"input": text, "model": "openai/text-embedding-3-small"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {openrouter_key}"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as res:
+                body = json.loads(res.read().decode("utf-8"))
+                return body["data"][0]["embedding"]
+        except Exception:
+            pass
+
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/embeddings",
+            data=json.dumps({"model": "nomic-embed-text", "prompt": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as res:
+            body = json.loads(res.read().decode("utf-8"))
+            emb = body["embedding"]
+            if len(emb) < 1536:
+                emb = emb + [0.0] * (1536 - len(emb))
+            return emb
+    except Exception:
+        pass
+        
+    words = text.lower().split()
+    dims = 1536
+    vector = [0.0] * dims
+    if not words:
+        return vector
+    for word in words:
+        for i in range(5):
+            h = hashlib.md5(f"{word}_{i}".encode("utf-8")).hexdigest()
+            idx = int(h, 16) % dims
+            val = (int(h[0:8], 16) / 4294967295.0) * 2.0 - 1.0
+            vector[idx] += val
+    norm = math.sqrt(sum(x * x for x in vector))
+    if norm > 0:
+        vector = [x / norm for x in vector]
+    return vector
+
+
+@app.post("/api/blogs/search")
+async def search_blogs(request: Request, body: BlogSearchRequest):
+    """Search for similar blogs within a project to avoid duplication."""
+    if not _is_local_request(request):
+        _require_token(request)
+        
+    try:
+        import psycopg2
+        _init_blog_db()
+        
+        query_vector = _generate_embedding(body.topic)
+        
+        host = os.environ.get("POSTGRES_HOST") or os.environ.get("PG_HOST") or "localhost"
+        port = int(os.environ.get("POSTGRES_PORT") or os.environ.get("PG_PORT") or "5432")
+        user = os.environ.get("POSTGRES_USER") or os.environ.get("PG_USER") or "postgres"
+        password = os.environ.get("POSTGRES_PASSWORD") or os.environ.get("PG_PASSWORD") or "postgres"
+        dbname = os.environ.get("POSTGRES_DB") or os.environ.get("PG_DB") or "postgres"
+        
+        conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
+        results = []
+        try:
+            cur = conn.cursor()
+            
+            cur.execute("""
+                SELECT data_type FROM information_schema.columns 
+                WHERE table_name = 'blog_metadata' AND column_name = 'embedding'
+            """)
+            row = cur.fetchone()
+            col_type = row[0] if row else "USER-DEFINED"
+            
+            if col_type == "USER-DEFINED":
+                cur.execute("""
+                    SELECT id, title, topic, slug, keywords, categories, author, wordpress_url, published_date,
+                           (1 - (embedding <=> %s::vector)) as similarity
+                    FROM blog_metadata
+                    WHERE project_id = %s AND (1 - (embedding <=> %s::vector)) >= %s
+                    ORDER BY similarity DESC
+                """, (query_vector, body.project_id, query_vector, body.threshold))
+            else:
+                cur.execute("""
+                    SELECT id, title, topic, slug, keywords, categories, author, wordpress_url, published_date,
+                           cosine_similarity(embedding, %s) as similarity
+                    FROM blog_metadata
+                    WHERE project_id = %s AND cosine_similarity(embedding, %s) >= %s
+                    ORDER BY similarity DESC
+                """, (query_vector, body.project_id, query_vector, body.threshold))
+                
+            rows = cur.fetchall()
+            for r in rows:
+                results.append({
+                    "id": r[0],
+                    "title": r[1],
+                    "topic": r[2],
+                    "slug": r[3],
+                    "keywords": r[4],
+                    "categories": r[5],
+                    "author": r[6],
+                    "wordpress_url": r[7],
+                    "published_date": r[8].isoformat() if r[8] else None,
+                    "similarity": r[9]
+                })
+            cur.close()
+        finally:
+            conn.close()
+            
+        similar_found = len(results) > 0
+        return {
+            "success": True,
+            "similar_found": similar_found,
+            "results": results
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.post("/api/blogs/publish")
+async def publish_blog(request: Request, body: BlogPublishRequest):
+    """Publish a blog to WordPress and store its metadata/embedding in the database."""
+    if not _is_local_request(request):
+        _require_token(request)
+        
+    try:
+        import psycopg2
+        import urllib.request
+        import urllib.error
+        import base64
+        import json
+        import time
+        
+        wp_url = os.environ.get("WORDPRESS_URL") or body.wordpress_url
+        wp_username = os.environ.get("WORDPRESS_USERNAME")
+        wp_password = os.environ.get("WORDPRESS_APPLICATION_PASSWORD")
+        
+        if not wp_url:
+            raise HTTPException(status_code=400, detail="WORDPRESS_URL must not be empty.")
+        if not wp_username or not wp_password:
+            raise HTTPException(status_code=400, detail="WordPress credentials not found in environment.")
+        if not body.title.strip():
+            raise HTTPException(status_code=400, detail="Title must not be empty.")
+        if not body.content.strip():
+            raise HTTPException(status_code=400, detail="Content must not be empty.")
+        if wp_url.endswith("/"):
+            wp_url = wp_url.rstrip("/")
+            
+        payload = {
+            "title": body.title,
+            "content": body.content,
+            "status": body.status or "publish"
+        }
+        if body.slug:
+            payload["slug"] = body.slug
+            
+        endpoint = f"{wp_url}/wp-json/wp/v2/posts"
+        auth_str = f"{wp_username}:{wp_password}"
+        auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
+        
+        request_payload = json.dumps(payload).encode("utf-8")
+        wp_request = urllib.request.Request(endpoint, data=request_payload)
+        wp_request.add_header("Content-Type", "application/json")
+        wp_request.add_header("Authorization", f"Basic {auth_b64}")
+        
+        retries = 3
+        delay = 1
+        post_id = None
+        post_url = None
+        response_body = None
+        status_code = None
+        
+        for attempt in range(retries + 1):
+            try:
+                with urllib.request.urlopen(wp_request, timeout=15) as res:
+                    response_body = res.read().decode("utf-8")
+                    response_data = json.loads(response_body)
+                    post_id = response_data.get("id")
+                    post_url = response_data.get("link")
+                    status_code = res.status
+                    break
+            except urllib.error.HTTPError as e:
+                status_code = e.code
+                try:
+                    response_body = e.read().decode("utf-8")
+                except Exception:
+                    response_body = str(e)
+                if status_code in (401, 403) or attempt == retries:
+                    return {
+                        "success": False,
+                        "status": status_code,
+                        "error": response_body
+                    }
+            except Exception as e:
+                response_body = str(e)
+                status_code = 500
+                if attempt == retries:
+                    return {
+                        "success": False,
+                        "status": 500,
+                        "error": response_body
+                    }
+            time.sleep(delay)
+            delay *= 2
+            
+        if not post_id:
+            return {
+                "success": False,
+                "status": status_code or 500,
+                "error": response_body or "Failed to create post."
+            }
+            
+        _init_blog_db()
+        topic_to_embed = body.topic or body.title
+        embedding = _generate_embedding(topic_to_embed)
+        
+        host = os.environ.get("POSTGRES_HOST") or os.environ.get("PG_HOST") or "localhost"
+        port = int(os.environ.get("POSTGRES_PORT") or os.environ.get("PG_PORT") or "5432")
+        user = os.environ.get("POSTGRES_USER") or os.environ.get("PG_USER") or "postgres"
+        password = os.environ.get("POSTGRES_PASSWORD") or os.environ.get("PG_PASSWORD") or "postgres"
+        dbname = os.environ.get("POSTGRES_DB") or os.environ.get("PG_DB") or "postgres"
+        
+        conn = psycopg2.connect(host=host, port=port, user=user, password=password, dbname=dbname)
+        conn.autocommit = True
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO blog_metadata (
+                    project_id, platform, title, topic, slug, keywords, categories, author, wordpress_url, embedding
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                body.project_id, body.platform, body.title, body.topic, body.slug,
+                body.keywords, body.categories, body.author, post_url, embedding
+            ))
+            cur.close()
+        finally:
+            conn.close()
+            
+        return {
+            "success": True,
+            "post_id": post_id,
+            "url": post_url
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 @app.get("/dashboard-plugins/{plugin_name}/{file_path:path}")
